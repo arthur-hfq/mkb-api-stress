@@ -1,0 +1,27 @@
+version: '3.8'
+services:
+  mkb_svc_postgres_5432:
+    image: postgres:16-alpine
+    container_name: mkb_svc_postgres_5432
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_USER=root
+      - POSTGRES_PASSWORD=password
+      - POSTGRES_DB=markab_db
+      - GOSU_VERSION=1.19
+      - LANG=en_US.utf8
+      - PG_MAJOR=16
+      - PG_VERSION=16.15
+      - PG_SHA256=c1575341fa7bd40f5274ea465b34390f4dc64cdd0770af327005caaeb9f6b7ed
+      - DOCKER_PG_LLVM_DEPS=llvm21-dev 		clang21
+      - PGDATA=/var/lib/postgresql/data
+    volumes:
+      - /home/mepper/.local/share/mkb-grid/volumes/mkb_vol_postgres_5432_data : /var/lib/postgresql/data
+    networks:
+      - mkb_net_test
+
+networks:
+  mkb_net_test:
+    external: true

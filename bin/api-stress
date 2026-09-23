@@ -1,0 +1,499 @@
+#!/usr/bin/env bash
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║  [MARKAB] DOCKER-ISOLATED API STRESS TEST ENGINE                ║
+# ║  Spins up a resource-constrained container, boots the server,   ║
+# ║  runs the load test from the HOST, and generates a report.      ║
+# ╚══════════════════════════════════════════════════════════════════╝
+
+set -euo pipefail
+
+show_help() {
+  cat << 'EOF'
+Usage:
+  api-stress [OPTIONS]
+  api-stress <project_dir> <cpus> <memory> <start_cmd> <port> <route> <method> <count> <concurrency> <timeout> [json_body]
+
+Options:
+  -d, --dir DIR           Project root directory (default: current directory)
+  -c, --cpus LIMIT        CPU limit (e.g., 0.5, 1.0, 2.0) [default: 0.5]
+  -m, --memory LIMIT      Memory limit (e.g., 256m, 512m, 1g) [default: 256m]
+  -s, --cmd CMD           Server start command inside container (e.g., "node index.js", "npm start")
+  -p, --port PORT         Internal container port the server listens on [default: 3000]
+  -r, --route ROUTE       API route path to test [default: /]
+  -X, --method METHOD     HTTP method: GET, POST, PUT, DELETE, PATCH [default: GET]
+  -n, --count NUM         Total number of requests to send [default: 100]
+  -C, --concurrency NUM   Number of concurrent requests [default: 10]
+  -t, --timeout SEC       Timeout per request in seconds [default: 5]
+  -b, --body JSON         Optional JSON request body for POST/PUT requests
+  -i, --interactive       Force interactive setup wizard
+  -h, --help              Show this help message
+
+Examples:
+  # Run in interactive wizard:
+  api-stress
+
+  # Test an Express/Node.js app:
+  api-stress -d ./my-api -s "node index.js" -p 3000 -r "/api/users" -n 200 -C 20
+
+  # Test a fast CPU route with 0.25 CPU and 128m RAM:
+  api-stress -d ./my-api --cpus 0.25 --memory 128m -s "node index.js" -p 3000 -r "/api/cpu" -n 50 -C 5
+EOF
+  exit 0
+}
+
+# Defaults
+PROJECT_DIR=""
+CPUS="0.5"
+MEMORY="256m"
+START_CMD=""
+PORT="3000"
+ROUTE="/"
+METHOD="GET"
+COUNT=100
+CONCURRENCY=10
+TIMEOUT=5
+BODY=""
+INTERACTIVE=0
+
+# Parse arguments
+if [ $# -eq 0 ]; then
+  INTERACTIVE=1
+elif [ "$1" == "-h" ] || [ "$1" == "--help" ]; then
+  show_help
+elif [ $# -ge 10 ] && [[ ! "$1" =~ ^- ]]; then
+  # Positional legacy arguments mode (Neovim caller)
+  PROJECT_DIR="$1"
+  CPUS="$2"
+  MEMORY="$3"
+  START_CMD="$4"
+  PORT="$5"
+  ROUTE="$6"
+  METHOD="$7"
+  COUNT="$8"
+  CONCURRENCY="$9"
+  TIMEOUT="${10}"
+  BODY="${11:-}"
+else
+  # Flag parsing mode
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -d|--dir) PROJECT_DIR="$2"; shift 2 ;;
+      -c|--cpus) CPUS="$2"; shift 2 ;;
+      -m|--memory) MEMORY="$2"; shift 2 ;;
+      -s|--cmd) START_CMD="$2"; shift 2 ;;
+      -p|--port) PORT="$2"; shift 2 ;;
+      -r|--route) ROUTE="$2"; shift 2 ;;
+      -X|--method) METHOD="$2"; shift 2 ;;
+      -n|--count) COUNT="$2"; shift 2 ;;
+      -C|--concurrency) CONCURRENCY="$2"; shift 2 ;;
+      -t|--timeout) TIMEOUT="$2"; shift 2 ;;
+      -b|--body) BODY="$2"; shift 2 ;;
+      -i|--interactive) INTERACTIVE=1; shift ;;
+      -h|--help) show_help ;;
+      *)
+        if [ -z "$PROJECT_DIR" ] && [ -d "$1" ]; then
+          PROJECT_DIR="$1"; shift
+        else
+          echo "[ERROR] Unknown option: $1"
+          show_help
+        fi
+        ;;
+    esac
+  done
+fi
+
+# Interactive mode if requested or missing required values
+if [ "$INTERACTIVE" -eq 1 ] || [ -z "$PROJECT_DIR" ] || [ -z "$START_CMD" ]; then
+  echo "╔══════════════════════════════════════════════════════════════╗"
+  echo "║  [MARKAB] API STRESS TEST INTERACTIVE WIZARD                 ║"
+  echo "╚══════════════════════════════════════════════════════════════╝"
+  
+  if [ -z "$PROJECT_DIR" ]; then
+    read -rp "  Project Directory [default: .]: " input_dir
+    PROJECT_DIR="${input_dir:-.}"
+  fi
+  PROJECT_DIR="$(cd "$PROJECT_DIR" 2>/dev/null && pwd || echo "$PROJECT_DIR")"
+  
+  if [ ! -d "$PROJECT_DIR" ]; then
+    echo "  [ERROR] Directory not found: $PROJECT_DIR"
+    exit 1
+  fi
+
+  # Auto-suggest start command based on files
+  SUGGESTED_CMD="node index.js"
+  if [ -f "$PROJECT_DIR/package.json" ]; then
+    if grep -q '"dev"' "$PROJECT_DIR/package.json" 2>/dev/null; then SUGGESTED_CMD="npm run dev";
+    elif grep -q '"start"' "$PROJECT_DIR/package.json" 2>/dev/null; then SUGGESTED_CMD="npm start";
+    else SUGGESTED_CMD="node index.js"; fi
+  elif [ -f "$PROJECT_DIR/main.py" ] || [ -f "$PROJECT_DIR/app.py" ]; then
+    SUGGESTED_CMD="python app.py"
+  elif [ -f "$PROJECT_DIR/main.go" ]; then
+    SUGGESTED_CMD="go run main.go"
+  elif [ -f "$PROJECT_DIR/Cargo.toml" ]; then
+    SUGGESTED_CMD="cargo run"
+  fi
+
+  if [ -z "$START_CMD" ]; then
+    read -rp "  Start Command inside container [default: $SUGGESTED_CMD]: " input_cmd
+    START_CMD="${input_cmd:-$SUGGESTED_CMD}"
+  fi
+
+  read -rp "  CPU Limit (e.g., 0.25, 0.5, 1.0) [default: $CPUS]: " input_cpus
+  CPUS="${input_cpus:-$CPUS}"
+
+  read -rp "  Memory Limit (e.g., 128m, 256m, 512m) [default: $MEMORY]: " input_mem
+  MEMORY="${input_mem:-$MEMORY}"
+
+  read -rp "  Container Port [default: $PORT]: " input_port
+  PORT="${input_port:-$PORT}"
+
+  read -rp "  Route to test [default: $ROUTE]: " input_route
+  ROUTE="${input_route:-$ROUTE}"
+
+  read -rp "  HTTP Method [default: $METHOD]: " input_method
+  METHOD="${input_method:-$METHOD}"
+
+  read -rp "  Total Requests [default: $COUNT]: " input_count
+  COUNT="${input_count:-$COUNT}"
+
+  read -rp "  Concurrency Level [default: $CONCURRENCY]: " input_conc
+  CONCURRENCY="${input_conc:-$CONCURRENCY}"
+
+  read -rp "  Timeout in seconds [default: $TIMEOUT]: " input_to
+  TIMEOUT="${input_to:-$TIMEOUT}"
+
+  if [[ "$METHOD" =~ ^(POST|PUT|PATCH)$ ]]; then
+    read -rp "  JSON Body (optional): " input_body
+    BODY="${input_body:-$BODY}"
+  fi
+  echo ""
+fi
+
+PROJECT_DIR="$(cd "$PROJECT_DIR" && pwd)"
+
+if ! command -v docker &> /dev/null; then
+  echo "[ERROR] Docker is required but not installed or not in PATH."
+  exit 1
+fi
+
+CONTAINER_NAME="markab_stress_$(date +%s)"
+HOST_PORT=$((49152 + RANDOM % 16384))
+IMAGE=""
+WORKDIR="/app"
+
+# ── PRE-FLIGHT CLEANUP ───────────────────────────────────────────
+ORPHANS=$(docker ps -a -q -f name=markab_stress_)
+if [ -n "$ORPHANS" ]; then
+  echo "┌─ CLEANING UP ORPHANED CONTAINERS ─────────────────────────────┐"
+  echo "  Killing lingering containers from previous aborted tests..."
+  docker rm -f $ORPHANS >/dev/null 2>&1 || true
+  echo "└───────────────────────────────────────────────────────────────┘"
+  echo ""
+fi
+
+# Set trap to clean up the CURRENT container if aborted
+trap 'echo -e "\n\n  [ABORTED] Cleaning up container $CONTAINER_NAME..."; docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1; exit 1' SIGINT SIGTERM
+
+# ── AUTO-DETECT PROJECT RUNTIME ──────────────────────────────────
+detect_image() {
+  if [ -f "$PROJECT_DIR/package.json" ]; then
+    IMAGE="node:22-alpine"
+    WORKDIR="/app"
+  elif [ -f "$PROJECT_DIR/requirements.txt" ] || [ -f "$PROJECT_DIR/Pipfile" ] || [ -f "$PROJECT_DIR/pyproject.toml" ]; then
+    IMAGE="python:3.12-slim"
+    WORKDIR="/app"
+  elif [ -f "$PROJECT_DIR/go.mod" ]; then
+    IMAGE="golang:1.23-alpine"
+    WORKDIR="/app"
+  elif [ -f "$PROJECT_DIR/composer.json" ]; then
+    IMAGE="php:8.3-cli"
+    WORKDIR="/app"
+  elif [ -f "$PROJECT_DIR/Cargo.toml" ]; then
+    IMAGE="rust:1.79-slim"
+    WORKDIR="/app"
+  elif [ -f "$PROJECT_DIR/Gemfile" ]; then
+    IMAGE="ruby:3.3-slim"
+    WORKDIR="/app"
+  else
+    IMAGE="alpine:latest"
+    WORKDIR="/app"
+  fi
+}
+
+detect_image
+
+# ── HEADER ───────────────────────────────────────────────────────
+echo "╔══════════════════════════════════════════════════════════════╗"
+echo "║  [MARKAB] DOCKER-ISOLATED STRESS TEST                        ║"
+echo "╠══════════════════════════════════════════════════════════════╣"
+echo "║  PROJECT  : $(basename "$PROJECT_DIR")"
+echo "║  IMAGE    : ${IMAGE}"
+echo "║  LIMITS   : ${CPUS} CPU | ${MEMORY} RAM"
+echo "║  SERVER   : ${START_CMD}"
+echo "║  ENDPOINT : ${METHOD} http://localhost:${HOST_PORT}${ROUTE}"
+echo "║  REQUESTS : ${COUNT} (Concurrency: ${CONCURRENCY})"
+if [ -n "$BODY" ]; then
+echo "║  BODY     : ${BODY}"
+fi
+echo "╚══════════════════════════════════════════════════════════════╝"
+echo ""
+
+# ── PHASE 1: BUILD / PREPARE ─────────────────────────────────────
+echo "┌─ PHASE 1: PREPARING CONTAINER ─────────────────────────────┐"
+echo "  Using runtime image: ${IMAGE}"
+echo "  Mounting local project: ${PROJECT_DIR} -> ${WORKDIR}"
+echo "└───────────────────────────────────────────────────────────────┘"
+echo ""
+
+# ── PHASE 2: START CONTAINER ─────────────────────────────────────
+echo "┌─ PHASE 2: STARTING CONTAINER (${CPUS} CPU / ${MEMORY} RAM) ┐"
+docker run -d \
+  --name "$CONTAINER_NAME" \
+  --cpus="$CPUS" \
+  --memory="$MEMORY" \
+  --add-host=host.docker.internal:host-gateway \
+  -v "${PROJECT_DIR}:${WORKDIR}" \
+  -w "${WORKDIR}" \
+  -p "${HOST_PORT}:${PORT}" \
+  "${IMAGE}" sh -c "${START_CMD}" 2>&1
+
+echo "  Container: ${CONTAINER_NAME}"
+echo "  Mapped port: host:${HOST_PORT} -> container:${PORT}"
+echo "└───────────────────────────────────────────────────────────────┘"
+echo ""
+
+# ── PHASE 3: WAIT FOR SERVER READY ───────────────────────────────
+echo "┌─ PHASE 3: WAITING FOR SERVER TO BE READY ─────────────────┐"
+MAX_WAIT=30
+READY=0
+for i in $(seq 1 $MAX_WAIT); do
+  HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:${HOST_PORT}${ROUTE}" 2>/dev/null || echo "000")
+  if [ "$HTTP_CODE" != "000" ]; then
+    echo "  Server responded with HTTP ${HTTP_CODE} after ${i}s"
+    READY=1
+    break
+  fi
+  printf "  Waiting... (%d/%ds)\r" "$i" "$MAX_WAIT"
+  sleep 1
+done
+
+if [ "$READY" -eq 0 ]; then
+  echo ""
+  echo "  [ERROR] Server did not respond within ${MAX_WAIT}s"
+  echo ""
+  echo "┌─ CONTAINER LOGS ─────────────────────────────────────────────┐"
+  docker logs "$CONTAINER_NAME" 2>&1 | tail -20
+  echo "└──────────────────────────────────────────────────────────────┘"
+  docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1
+  exit 1
+fi
+echo "└───────────────────────────────────────────────────────────────┘"
+echo ""
+
+# ── PHASE 4: CAPTURE BASELINE METRICS ───────────────────────────
+echo "┌─ PHASE 4: BASELINE CONTAINER METRICS ─────────────────────┐"
+BASELINE_STATS=$(docker stats "$CONTAINER_NAME" --no-stream --format "CPU: {{.CPUPerc}} | MEM: {{.MemUsage}} | NET: {{.NetIO}}" 2>/dev/null || echo "N/A")
+echo "  IDLE: ${BASELINE_STATS}"
+echo "└───────────────────────────────────────────────────────────────┘"
+echo ""
+
+# ── PHASE 5: FIRE STRESS TEST (PARALLEL) ───────────────────────────
+echo "┌─ PHASE 5: FIRING ${COUNT} REQUESTS IN PARALLEL ────────────────┐"
+echo ""
+
+TMP_STATS="/tmp/markab_stress_stats_$$"
+> "$TMP_STATS"
+(
+  while true; do
+    docker stats "$CONTAINER_NAME" --no-stream --format "{{.CPUPerc}}*{{.MemUsage}}" 2>/dev/null >> "$TMP_STATS" || true
+    sleep 0.2
+  done
+) &
+STATS_PID=$!
+
+export TARGET_URL="http://localhost:${HOST_PORT}${ROUTE}"
+export METHOD
+export BODY
+export TIMEOUT
+TOTAL=$COUNT
+
+SUCCESS=0
+FAIL=0
+TOTAL_TIME=0
+MIN_TIME=999999
+MAX_TIME=0
+HTTP_2XX=0
+HTTP_3XX=0
+HTTP_4XX=0
+HTTP_5XX=0
+declare -a TIMES
+declare -a CODES
+
+TMP_RESULTS="/tmp/markab_stress_results_$$"
+
+WALL_START=$(date +%s%N)
+
+seq 1 $TOTAL | xargs -P $CONCURRENCY -I {} bash -c '
+  REQ_ID={}
+  START=$(date +%s%N)
+  if [ -n "$BODY" ]; then
+    HTTP_CODE=$(curl --max-time "$TIMEOUT" -s -o /dev/null -w "%{http_code}" -X "$METHOD" -d "$BODY" -H "Content-Type: application/json" "$TARGET_URL" 2>/dev/null || echo "000")
+  else
+    HTTP_CODE=$(curl --max-time "$TIMEOUT" -s -o /dev/null -w "%{http_code}" -X "$METHOD" "$TARGET_URL" 2>/dev/null || echo "000")
+  fi
+  END=$(date +%s%N)
+  ELAPSED=$(( (END - START) / 1000000 ))
+
+  if [ "$HTTP_CODE" -ge 200 ] 2>/dev/null && [ "$HTTP_CODE" -lt 300 ] 2>/dev/null; then STATUS="[OK ]"
+  elif [ "$HTTP_CODE" -ge 300 ] 2>/dev/null && [ "$HTTP_CODE" -lt 400 ] 2>/dev/null; then STATUS="[3XX]"
+  elif [ "$HTTP_CODE" -ge 400 ] 2>/dev/null && [ "$HTTP_CODE" -lt 500 ] 2>/dev/null; then STATUS="[4XX]"
+  else STATUS="[5XX]"; fi
+
+  printf "  REQ %03d | HTTP %s | %5dms | %s\n" "$REQ_ID" "$HTTP_CODE" "$ELAPSED" "$STATUS"
+
+  echo "$REQ_ID $HTTP_CODE $ELAPSED" >> "$1"
+' _ "$TMP_RESULTS"
+
+WALL_END=$(date +%s%N)
+WALL_ELAPSED=$(( (WALL_END - WALL_START) / 1000000 ))
+
+kill $STATS_PID 2>/dev/null || true
+wait $STATS_PID 2>/dev/null || true
+
+while read -r REQ_ID HTTP_CODE ELAPSED; do
+  TIMES+=($ELAPSED)
+  CODES+=($HTTP_CODE)
+  TOTAL_TIME=$((TOTAL_TIME + ELAPSED))
+
+  if [ "$HTTP_CODE" -ge 200 ] 2>/dev/null && [ "$HTTP_CODE" -lt 300 ] 2>/dev/null; then
+    SUCCESS=$((SUCCESS + 1)); HTTP_2XX=$((HTTP_2XX + 1))
+  elif [ "$HTTP_CODE" -ge 300 ] 2>/dev/null && [ "$HTTP_CODE" -lt 400 ] 2>/dev/null; then
+    SUCCESS=$((SUCCESS + 1)); HTTP_3XX=$((HTTP_3XX + 1))
+  elif [ "$HTTP_CODE" -ge 400 ] 2>/dev/null && [ "$HTTP_CODE" -lt 500 ] 2>/dev/null; then
+    FAIL=$((FAIL + 1)); HTTP_4XX=$((HTTP_4XX + 1))
+  else
+    FAIL=$((FAIL + 1)); HTTP_5XX=$((HTTP_5XX + 1))
+  fi
+
+  if [ "$ELAPSED" -lt "$MIN_TIME" ]; then MIN_TIME=$ELAPSED; fi
+  if [ "$ELAPSED" -gt "$MAX_TIME" ]; then MAX_TIME=$ELAPSED; fi
+done < <(sort -n -k1 "$TMP_RESULTS")
+
+rm -f "$TMP_RESULTS"
+
+echo "  Done! $TOTAL requests sent (Concurrency: $CONCURRENCY)"
+echo ""
+echo "└───────────────────────────────────────────────────────────────┘"
+echo ""
+
+# ── PHASE 6: CAPTURE PEAK METRICS ───────────────────────────────
+echo "┌─ PHASE 6: PEAK CONTAINER METRICS ─────────────────────────┐"
+PEAK_STATS=$(docker stats "$CONTAINER_NAME" --no-stream --format "CPU: {{.CPUPerc}} | MEM: {{.MemUsage}} | NET: {{.NetIO}}" 2>/dev/null || echo "N/A")
+echo "  PEAK: ${PEAK_STATS}"
+echo "└───────────────────────────────────────────────────────────────┘"
+echo ""
+
+# ── PHASE 7: REPORT ─────────────────────────────────────────────
+AVG=$((TOTAL_TIME / TOTAL))
+
+# Calculate P95
+IFS=$'\n' SORTED_TIMES=($(sort -n <<<"${TIMES[*]}")); unset IFS
+P95_IDX=$(( (TOTAL * 95 / 100) - 1 ))
+if [ "$P95_IDX" -lt 0 ]; then P95_IDX=0; fi
+P95=${SORTED_TIMES[$P95_IDX]:-$AVG}
+
+# Calculate P99
+P99_IDX=$(( (TOTAL * 99 / 100) - 1 ))
+if [ "$P99_IDX" -lt 0 ]; then P99_IDX=0; fi
+P99=${SORTED_TIMES[$P99_IDX]:-$AVG}
+
+# Requests per second (Based on Wall Clock Time)
+if [ "$WALL_ELAPSED" -gt 0 ]; then
+  RPS=$(echo "scale=2; $TOTAL * 1000 / $WALL_ELAPSED" | bc 2>/dev/null || echo "N/A")
+else
+  RPS="INF"
+fi
+
+echo "╔══════════════════════════════════════════════════════════════╗"
+echo "║  [MARKAB] STRESS TEST REPORT                                 ║"
+echo "╠══════════════════════════════════════════════════════════════╣"
+echo "║"
+printf "║  ENVIRONMENT : Docker (%-4s CPU | %-6s RAM)\n" "$CPUS" "$MEMORY"
+printf "║  TOTAL REQS  : %d\n" "$TOTAL"
+printf "║  SUCCESS     : %d (%d%%)\n" "$SUCCESS" "$((SUCCESS * 100 / TOTAL))"
+printf "║  FAILED      : %d (%d%%)\n" "$FAIL" "$((FAIL * 100 / TOTAL))"
+echo "║"
+draw_bar() {
+  local val=$1
+  local total=$2
+  local width=20
+  if [ "$total" -eq 0 ]; then
+    echo -n ""
+    return
+  fi
+  local blocks=$(( val * width / total ))
+  local bar=""
+  for ((i=0; i<blocks; i++)); do bar="${bar}█"; done
+  echo -n "$bar"
+}
+
+echo "╠── HTTP STATUS VISUALIZER ──────────────────────────────────╣"
+printf "║  2XX (OK)      : %-4d │ %s\n" "$HTTP_2XX" "$(draw_bar "$HTTP_2XX" "$TOTAL")"
+printf "║  3XX (Redirect): %-4d │ %s\n" "$HTTP_3XX" "$(draw_bar "$HTTP_3XX" "$TOTAL")"
+printf "║  4XX (Client)  : %-4d │ %s\n" "$HTTP_4XX" "$(draw_bar "$HTTP_4XX" "$TOTAL")"
+printf "║  5XX (Server)  : %-4d │ %s\n" "$HTTP_5XX" "$(draw_bar "$HTTP_5XX" "$TOTAL")"
+echo "║"
+echo "╠── LATENCY ─────────────────────────────────────────────────╣"
+printf "║  AVG     : %dms\n" "$AVG"
+printf "║  MIN     : %dms\n" "$MIN_TIME"
+printf "║  MAX     : %dms\n" "$MAX_TIME"
+printf "║  P95     : %dms\n" "$P95"
+printf "║  P99     : %dms\n" "$P99"
+echo "║"
+echo "╠── THROUGHPUT ──────────────────────────────────────────────╣"
+printf "║  REQ/SEC    : %s\n" "$RPS"
+printf "║  TOTAL TIME : %dms\n" "$TOTAL_TIME"
+echo "║"
+echo "╠── CONTAINER RESOURCES (LIVE PROFILING) ────────────────────╣"
+echo "║  IDLE : ${BASELINE_STATS}"
+if [ -f "$TMP_STATS" ] && [ -s "$TMP_STATS" ]; then
+  MAX_MEM=$(awk -F'*' '{print $2}' "$TMP_STATS" | awk -F' / ' '{print $1}' | sort -hr | head -n1)
+  
+  echo "║"
+  echo "║  CPU LOAD TIMELINE (Capacity Reached %):"
+  
+  awk -v limit="$CPUS" -F'*' '
+  {
+    cpu=$1; gsub(/%/, "", cpu);
+    norm_cpu = (cpu / (limit * 100)) * 100;
+    if (norm_cpu > max_cpu) max_cpu = norm_cpu;
+    
+    bar_len = int(norm_cpu / 5);
+    if(bar_len > 20) bar_len = 20;
+    bar = "";
+    for(i=0; i<bar_len; i++) bar = bar "█";
+    
+    printf "║    %-6s |%s\n", sprintf("%.1f%%", norm_cpu), bar;
+  }
+  END {
+    if (max_cpu == "") max_cpu = 0.0;
+    printf "║\n║  MAX CPU : %.1f%% (Normalized)\n", max_cpu;
+  }' "$TMP_STATS" | head -n 25
+  
+  printf "║  MAX RAM : %s\n" "$MAX_MEM"
+  
+  if [ $(wc -l < "$TMP_STATS") -gt 25 ]; then
+    echo "║    ... (timeline truncated for brevity)"
+  fi
+else
+  echo "║  PEAK : ${PEAK_STATS}"
+fi
+echo "║"
+rm -f "$TMP_STATS"
+echo "╚══════════════════════════════════════════════════════════════╝"
+
+# ── CLEANUP ──────────────────────────────────────────────────────
+echo ""
+echo "┌─ CLEANUP ──────────────────────────────────────────────────┐"
+docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 && echo "  Container removed: ${CONTAINER_NAME}"
+echo "└───────────────────────────────────────────────────────────────┘"
